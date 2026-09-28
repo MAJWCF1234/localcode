@@ -29,9 +29,31 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [settings, setSettings] = useState(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [modelOptions, setModelOptions] = useState([]);
+  const [modelStatus, setModelStatus] = useState('');
 
   const refresh = async () => setTree(await window.localcode.tree());
-  useEffect(() => { refresh(); window.localcode.getSettings().then(setSettings); }, []);
+
+  useEffect(() => {
+    refresh();
+    window.localcode.getSettings().then(setSettings);
+    const unsubscribe = window.localcode.onWorkspaceChanged?.(() => refresh());
+    return () => unsubscribe?.();
+  }, []);
+
+  useEffect(() => {
+    const onKeyDown = async (event) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
+        event.preventDefault();
+        if (current && dirty) {
+          await window.localcode.write(current, content);
+          setDirty(false);
+        }
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [current, content, dirty]);
 
   const openFile = async (path) => {
     if (dirty && current) await window.localcode.write(current, content);
@@ -62,6 +84,20 @@ function App() {
     refresh();
   };
 
+  const detectModels = async () => {
+    if (!settings) return;
+    setModelStatus('Checking local server…');
+    try {
+      const models = await window.localcode.listModels(settings);
+      setModelOptions(models);
+      setModelStatus(models.length ? `Connected · ${models.length} model${models.length === 1 ? '' : 's'} found` : 'Connected · no models reported');
+      if (!settings.model && models[0]) setSettings({ ...settings, model: models[0] });
+    } catch (error) {
+      setModelOptions([]);
+      setModelStatus(`Connection failed: ${error.message}`);
+    }
+  };
+
   const run = async () => {
     const text = prompt.trim();
     if (!text || !settings || busy) return;
@@ -72,7 +108,15 @@ function App() {
       const result = await window.localcode.runAgent(text, settings);
       setMessages(m => [...m, { who:'agent', text: result.message, log: result.log }]);
       setTree(result.tree || await window.localcode.tree());
-      if (current) setContent(await window.localcode.read(current));
+      if (current) {
+        try {
+          setContent(await window.localcode.read(current));
+        } catch {
+          setCurrent('');
+          setContent('');
+          setDirty(false);
+        }
+      }
     } catch (e) {
       setMessages(m => [...m, { who:'error', text: e.message }]);
     } finally { setBusy(false); }
@@ -81,12 +125,19 @@ function App() {
   const title = useMemo(() => current ? `${current}${dirty ? ' •' : ''}` : 'No file open', [current, dirty]);
 
   return <div className="app">
-    <header><div className="brand">LOCALCODE</div><div className="status">workspace/ only</div><button onClick={() => setSettingsOpen(!settingsOpen)}>Settings</button></header>
+    <header><div className="brand">LOCALCODE</div><div className="status">workspace/ only · live filesystem</div><button onClick={() => setSettingsOpen(!settingsOpen)}>Settings</button></header>
     {settingsOpen && settings && <section className="settings">
       <label>Base URL<input value={settings.baseUrl} onChange={e => setSettings({...settings, baseUrl:e.target.value})}/></label>
-      <label>Model<input value={settings.model} onChange={e => setSettings({...settings, model:e.target.value})}/></label>
+      <label>Model
+        <input list="localcode-models" value={settings.model} onChange={e => setSettings({...settings, model:e.target.value})}/>
+        <datalist id="localcode-models">{modelOptions.map(model => <option key={model} value={model}/>)}</datalist>
+      </label>
       <label>API key<input value={settings.apiKey} onChange={e => setSettings({...settings, apiKey:e.target.value})}/></label>
-      <button onClick={async()=>{await window.localcode.setSettings(settings); setSettingsOpen(false)}}>Save settings</button>
+      <div className="settings-actions">
+        <button onClick={detectModels}>Detect models</button>
+        <button onClick={async()=>{await window.localcode.setSettings(settings); setSettingsOpen(false)}}>Save settings</button>
+      </div>
+      {modelStatus && <div className={`connection-status ${modelStatus.startsWith('Connection failed') ? 'bad' : ''}`}>{modelStatus}</div>}
     </section>}
     <main>
       <aside className="files">
