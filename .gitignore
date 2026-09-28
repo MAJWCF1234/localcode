@@ -1,5 +1,7 @@
 node_modules/
 dist/
 localcode.settings.json
+localcode.sessions.json
+.localcode-sync-backup/
 workspace/*
 !workspace/.gitkeep
