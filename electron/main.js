@@ -11,6 +11,7 @@ const ROOT = path.resolve(__dirname, '..');
 const WORKSPACE = path.join(ROOT, 'workspace');
 const SETTINGS = path.join(ROOT, 'localcode.settings.json');
 const SESSIONS = path.join(ROOT, 'localcode.sessions.json');
+const HISTORY = path.join(ROOT, '.localcode-history');
 
 let workspaceWatcher = null;
 let workspaceWatchTimer = null;
@@ -266,6 +267,97 @@ function emitAgent(sender, runId, event) {
 }
 
 
+
+async function ensureHistory() {
+  await fs.mkdir(HISTORY, { recursive: true });
+}
+
+function historyRunDir(runId) {
+  return path.join(HISTORY, runId);
+}
+
+async function captureBefore(runId, rel) {
+  const state = activeRuns.get(runId);
+  if (!state) return;
+  if (!state.snapshots) state.snapshots = new Map();
+
+  const normalized = path.relative(WORKSPACE, lexicalSafePath(rel)).replaceAll('\\', '/');
+  if (!normalized || state.snapshots.has(normalized)) return;
+
+  const target = await safePath(normalized, true);
+  let existed = false;
+  let kind = 'missing';
+
+  try {
+    const st = await fs.lstat(target);
+    if (st.isSymbolicLink()) throw new Error('Symlinks cannot be snapshotted');
+    existed = true;
+    kind = st.isDirectory() ? 'dir' : 'file';
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
+  }
+
+  const snapshot = { path: normalized, existed, kind };
+  state.snapshots.set(normalized, snapshot);
+
+  if (existed) {
+    const backup = path.join(historyRunDir(runId), 'before', ...normalized.split('/'));
+    await fs.mkdir(path.dirname(backup), { recursive: true });
+    if (kind === 'dir') await fs.cp(target, backup, { recursive: true, force: true });
+    else await fs.copyFile(target, backup);
+  }
+}
+
+async function finalizeHistory(runId) {
+  const state = activeRuns.get(runId);
+  if (!state?.snapshots?.size) return [];
+
+  await ensureHistory();
+  const changes = Array.from(state.snapshots.values());
+  const dir = historyRunDir(runId);
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(path.join(dir, 'manifest.json'), JSON.stringify({
+    runId,
+    createdAt: new Date().toISOString(),
+    changes,
+    terminalUsed: Boolean(state.terminalUsed)
+  }, null, 2) + '\n', 'utf8');
+
+  return changes;
+}
+
+async function readHistoryManifest(runId) {
+  const manifestPath = path.join(historyRunDir(runId), 'manifest.json');
+  return JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+}
+
+async function undoHistoryRun(runId) {
+  const manifest = await readHistoryManifest(runId);
+  const entries = Array.isArray(manifest.changes) ? manifest.changes : [];
+
+  const byDepthDesc = [...entries].sort((a, b) => b.path.split('/').length - a.path.split('/').length);
+  for (const entry of byDepthDesc) {
+    const target = await safePath(entry.path, true);
+    await fs.rm(target, { recursive: true, force: true });
+  }
+
+  const byDepthAsc = [...entries].sort((a, b) => a.path.split('/').length - b.path.split('/').length);
+  for (const entry of byDepthAsc) {
+    if (!entry.existed) continue;
+    const target = await safePath(entry.path, true);
+    const backup = path.join(historyRunDir(runId), 'before', ...entry.path.split('/'));
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    if (entry.kind === 'dir') await fs.cp(backup, target, { recursive: true, force: true });
+    else await fs.copyFile(backup, target);
+  }
+
+  return {
+    restored: entries.map(entry => entry.path),
+    terminalUsed: Boolean(manifest.terminalUsed),
+    tree: await walk()
+  };
+}
+
 function requestCommandApproval(sender, runId, command) {
   return new Promise((resolve) => {
     const approvalId = randomUUID();
@@ -309,6 +401,9 @@ async function runApprovedCommand(command, runId, sender, controller) {
   const allowed = await requestCommandApproval(sender, runId, clean);
   if (!allowed) return { approved: false, output: 'COMMAND DENIED BY USER' };
   if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+
+  const runStateForTerminal = activeRuns.get(runId);
+  if (runStateForTerminal) runStateForTerminal.terminalUsed = true;
 
   emitAgent(sender, runId, {
     type: 'terminal',
@@ -389,7 +484,7 @@ async function runApprovedCommand(command, runId, sender, controller) {
 async function runAgent(prompt, settings, sessionId, runId, sender) {
   await ensureWorkspace();
   const controller = new AbortController();
-  activeRuns.set(runId, { controller, child: null });
+  activeRuns.set(runId, { controller, child: null, snapshots: new Map(), terminalUsed: false });
 
   const store = await loadSessionStore();
   const session = store.sessions.find(s => s.id === sessionId) || store.sessions.find(s => s.id === store.activeId);
@@ -473,24 +568,29 @@ ${files.join('\n') || '(empty)'}`
           }
           case 'write':
             emitAgent(sender, runId, { type: 'tool', tool: 'write', text: `Writing ${action.path}`, path: action.path });
+            await captureBefore(runId, action.path);
             await writeText(action.path, String(action.content ?? ''));
             result = `wrote ${action.path}`;
             log.push(result);
             break;
           case 'mkdir':
             emitAgent(sender, runId, { type: 'tool', tool: 'mkdir', text: `Creating ${action.path}`, path: action.path });
+            await captureBefore(runId, action.path);
             await fs.mkdir(await safePath(action.path, true), { recursive: true });
             result = `created directory ${action.path}`;
             log.push(result);
             break;
           case 'delete':
             emitAgent(sender, runId, { type: 'tool', tool: 'delete', text: `Deleting ${action.path}`, path: action.path });
+            await captureBefore(runId, action.path);
             await deletePath(action.path);
             result = `deleted ${action.path}`;
             log.push(result);
             break;
           case 'rename':
             emitAgent(sender, runId, { type: 'tool', tool: 'rename', text: `Renaming ${action.from} → ${action.to}` });
+            await captureBefore(runId, action.from);
+            await captureBefore(runId, action.to);
             await renamePath(action.from, action.to);
             result = `renamed ${action.from} -> ${action.to}`;
             log.push(result);
@@ -511,18 +611,23 @@ ${files.join('\n') || '(empty)'}`
             break;
           }
           case 'done': {
+            const changes = await finalizeHistory(runId);
+            const terminalUsed = Boolean(activeRuns.get(runId)?.terminalUsed);
             const assistantMessage = {
               id: randomUUID(),
               role: 'assistant',
               content: action.message || 'Done.',
               log,
+              runId,
+              changes,
+              terminalUsed,
               createdAt: new Date().toISOString()
             };
             session.messages.push(assistantMessage);
             session.updatedAt = new Date().toISOString();
             await saveSessionStore(store);
             emitAgent(sender, runId, { type: 'done', text: assistantMessage.content });
-            return { message: assistantMessage.content, log, tree: await walk(), chat: publicChatState(store) };
+            return { message: assistantMessage.content, log, changes, terminalUsed, runId, tree: await walk(), chat: publicChatState(store) };
           }
           default:
             result = `Unknown action ${action.action}`;
@@ -539,14 +644,18 @@ ${files.join('\n') || '(empty)'}`
     }
 
     const message = `Stopped after ${maxSteps} agent steps before receiving a done action.`;
-    session.messages.push({ id: randomUUID(), role: 'assistant', content: message, log, createdAt: new Date().toISOString() });
+    const changes = await finalizeHistory(runId);
+    const terminalUsed = Boolean(activeRuns.get(runId)?.terminalUsed);
+    session.messages.push({ id: randomUUID(), role: 'assistant', content: message, log, runId, changes, terminalUsed, createdAt: new Date().toISOString() });
     session.updatedAt = new Date().toISOString();
     await saveSessionStore(store);
     return { message, log, tree: await walk(), chat: publicChatState(store) };
   } catch (err) {
     if (err?.name === 'AbortError') {
       const message = 'Run cancelled.';
-      session.messages.push({ id: randomUUID(), role: 'assistant', content: message, log, createdAt: new Date().toISOString() });
+      const changes = await finalizeHistory(runId);
+      const terminalUsed = Boolean(activeRuns.get(runId)?.terminalUsed);
+      session.messages.push({ id: randomUUID(), role: 'assistant', content: message, log, runId, changes, terminalUsed, createdAt: new Date().toISOString() });
       session.updatedAt = new Date().toISOString();
       await saveSessionStore(store);
       emitAgent(sender, runId, { type: 'cancelled', text: message });
@@ -614,6 +723,7 @@ app.whenReady().then(async () => {
   ipcMain.handle('chat:new', () => createChat());
   ipcMain.handle('chat:select', (_, id) => selectChat(id));
   ipcMain.handle('chat:delete', (_, id) => deleteChat(id));
+  ipcMain.handle('history:undo', (_, runId) => undoHistoryRun(runId));
 
   ipcMain.handle('agent:run', (event, prompt, settings, sessionId, runId) => runAgent(prompt, settings, sessionId, runId, event.sender));
   ipcMain.handle('agent:cancel', (_, runId) => {
