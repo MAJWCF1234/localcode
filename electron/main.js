@@ -92,6 +92,26 @@ async function writeText(rel, content) {
   return true;
 }
 
+
+async function replaceText(rel, oldText, newText, replaceAll = false) {
+  const current = await readText(rel);
+  const needle = String(oldText ?? '');
+  if (!needle) throw new Error('replace requires non-empty old text');
+
+  const count = current.split(needle).length - 1;
+  if (count === 0) throw new Error('replace target text was not found');
+  if (!replaceAll && count !== 1) {
+    throw new Error(`replace target is ambiguous: found ${count} matches`);
+  }
+
+  const next = replaceAll
+    ? current.split(needle).join(String(newText ?? ''))
+    : current.replace(needle, String(newText ?? ''));
+
+  await writeText(rel, next);
+  return { replacements: replaceAll ? count : 1 };
+}
+
 async function deletePath(rel) {
   const p = await safePath(rel);
   if (p === WORKSPACE) throw new Error('Cannot delete workspace root');
@@ -513,6 +533,7 @@ Available actions:
 - {"action":"read","path":"relative/path"}
 - {"action":"search","query":"text"}
 - {"action":"write","path":"relative/path","content":"complete file contents"}
+- {"action":"replace","path":"relative/path","old":"exact text to replace","new":"replacement text","all":false}
 - {"action":"mkdir","path":"relative/folder"}
 - {"action":"delete","path":"relative/path"}
 - {"action":"rename","from":"old/path","to":"new/path"}
@@ -521,6 +542,7 @@ Available actions:
 
 Return exactly ONE JSON object per turn and no other text.
 Use read before editing an existing file unless its current contents were already provided.
+Prefer replace for small surgical edits to existing files. Use write when creating a new file or when replacing the whole file is genuinely simpler.
 Use search when you know a symbol or phrase but not its location.
 Never use absolute paths or .. segments.
 When writing, provide COMPLETE replacement file contents.
@@ -573,6 +595,14 @@ ${files.join('\n') || '(empty)'}`
             result = `wrote ${action.path}`;
             log.push(result);
             break;
+          case 'replace': {
+            emitAgent(sender, runId, { type: 'tool', tool: 'replace', text: `Editing ${action.path}`, path: action.path });
+            await captureBefore(runId, action.path);
+            const replaced = await replaceText(action.path, action.old, action.new, Boolean(action.all));
+            result = `replaced ${replaced.replacements} occurrence(s) in ${action.path}`;
+            log.push(result);
+            break;
+          }
           case 'mkdir':
             emitAgent(sender, runId, { type: 'tool', tool: 'mkdir', text: `Creating ${action.path}`, path: action.path });
             await captureBefore(runId, action.path);
