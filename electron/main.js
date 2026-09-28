@@ -2,6 +2,7 @@ import { app, BrowserWindow, ipcMain } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
+import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
@@ -14,6 +15,7 @@ const SESSIONS = path.join(ROOT, 'localcode.sessions.json');
 let workspaceWatcher = null;
 let workspaceWatchTimer = null;
 const activeRuns = new Map();
+const pendingApprovals = new Map();
 
 function lexicalSafePath(rel = '') {
   if (path.isAbsolute(rel) || rel.split(/[\\/]+/).includes('..')) {
@@ -263,10 +265,131 @@ function emitAgent(sender, runId, event) {
   if (!sender?.isDestroyed()) sender.send('agent:event', { runId, ...event });
 }
 
+
+function requestCommandApproval(sender, runId, command) {
+  return new Promise((resolve) => {
+    const approvalId = randomUUID();
+    pendingApprovals.set(approvalId, { resolve, runId });
+    emitAgent(sender, runId, {
+      type: 'approval',
+      approvalId,
+      command,
+      text: 'Command requires approval'
+    });
+  });
+}
+
+function resolveApproval(approvalId, allowed) {
+  const pending = pendingApprovals.get(approvalId);
+  if (!pending) return false;
+  pendingApprovals.delete(approvalId);
+  pending.resolve(Boolean(allowed));
+  return true;
+}
+
+function cancelApprovalsForRun(runId) {
+  for (const [approvalId, pending] of pendingApprovals.entries()) {
+    if (pending.runId === runId) {
+      pendingApprovals.delete(approvalId);
+      pending.resolve(false);
+    }
+  }
+}
+
+async function runApprovedCommand(command, runId, sender, controller) {
+  const clean = String(command || '').trim();
+  if (!clean) throw new Error('Empty command');
+
+  emitAgent(sender, runId, {
+    type: 'approval',
+    text: 'Waiting for command approval…',
+    command: clean
+  });
+
+  const allowed = await requestCommandApproval(sender, runId, clean);
+  if (!allowed) return { approved: false, output: 'COMMAND DENIED BY USER' };
+  if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+
+  emitAgent(sender, runId, {
+    type: 'terminal',
+    text: `Running: ${clean}`,
+    command: clean
+  });
+
+  return await new Promise((resolve, reject) => {
+    const child = spawn(clean, {
+      cwd: WORKSPACE,
+      shell: true,
+      windowsHide: true,
+      env: process.env
+    });
+
+    const runState = activeRuns.get(runId);
+    if (runState) runState.child = child;
+
+    let stdout = '';
+    let stderr = '';
+    let finished = false;
+    const OUTPUT_LIMIT = 200_000;
+    const TIMEOUT_MS = 120_000;
+
+    const append = (kind, chunk) => {
+      const text = chunk.toString();
+      if (kind === 'stdout') stdout = (stdout + text).slice(-OUTPUT_LIMIT);
+      else stderr = (stderr + text).slice(-OUTPUT_LIMIT);
+      emitAgent(sender, runId, {
+        type: 'terminal-output',
+        stream: kind,
+        text: text.slice(0, 2000)
+      });
+    };
+
+    child.stdout?.on('data', chunk => append('stdout', chunk));
+    child.stderr?.on('data', chunk => append('stderr', chunk));
+
+    const finish = (fn, value) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      controller.signal.removeEventListener('abort', onAbort);
+      const state = activeRuns.get(runId);
+      if (state?.child === child) state.child = null;
+      fn(value);
+    };
+
+    const onAbort = () => {
+      try { child.kill(); } catch {}
+      finish(reject, new DOMException('Aborted', 'AbortError'));
+    };
+
+    controller.signal.addEventListener('abort', onAbort, { once: true });
+
+    const timer = setTimeout(() => {
+      try { child.kill(); } catch {}
+      finish(resolve, {
+        approved: true,
+        timedOut: true,
+        exitCode: null,
+        output: `COMMAND TIMED OUT AFTER 120 SECONDS\n\nSTDOUT:\n${stdout}\n\nSTDERR:\n${stderr}`
+      });
+    }, TIMEOUT_MS);
+
+    child.on('error', err => finish(reject, err));
+    child.on('close', code => {
+      finish(resolve, {
+        approved: true,
+        timedOut: false,
+        exitCode: code,
+        output: `EXIT CODE: ${code}\n\nSTDOUT:\n${stdout || '(empty)'}\n\nSTDERR:\n${stderr || '(empty)'}`
+      });
+    });
+  });
+}
+
 async function runAgent(prompt, settings, sessionId, runId, sender) {
   await ensureWorkspace();
   const controller = new AbortController();
-  activeRuns.set(runId, controller);
+  activeRuns.set(runId, { controller, child: null });
 
   const store = await loadSessionStore();
   const session = store.sessions.find(s => s.id === sessionId) || store.sessions.find(s => s.id === store.activeId);
@@ -298,6 +421,7 @@ Available actions:
 - {"action":"mkdir","path":"relative/folder"}
 - {"action":"delete","path":"relative/path"}
 - {"action":"rename","from":"old/path","to":"new/path"}
+- {"action":"run","command":"command to execute from workspace"}
 - {"action":"done","message":"clear summary of what you did or what you found"}
 
 Return exactly ONE JSON object per turn and no other text.
@@ -305,7 +429,7 @@ Use read before editing an existing file unless its current contents were alread
 Use search when you know a symbol or phrase but not its location.
 Never use absolute paths or .. segments.
 When writing, provide COMPLETE replacement file contents.
-Do not claim a build/test passed because no terminal execution tool is currently available.
+Use run when you need to build, test, inspect compiler output, or execute project tooling. Every command requires explicit user approval before execution. Commands start in ./workspace but are real machine shell commands, so keep them focused and necessary. Report build/test results only from actual command output.
 Finish with done.
 
 Current workspace files:
@@ -376,6 +500,16 @@ ${files.join('\n') || '(empty)'}`
             result = (await listFlat()).join('\n') || '(empty)';
             log.push('listed workspace');
             break;
+          case 'run': {
+            const commandResult = await runApprovedCommand(action.command, runId, sender, controller);
+            result = commandResult.output;
+            if (commandResult.approved) {
+              log.push(`ran command: ${action.command} (exit ${commandResult.exitCode ?? 'timeout'})`);
+            } else {
+              log.push(`command denied: ${action.command}`);
+            }
+            break;
+          }
           case 'done': {
             const assistantMessage = {
               id: randomUUID(),
@@ -420,6 +554,7 @@ ${files.join('\n') || '(empty)'}`
     }
     throw err;
   } finally {
+    cancelApprovalsForRun(runId);
     activeRuns.delete(runId);
   }
 }
@@ -482,11 +617,14 @@ app.whenReady().then(async () => {
 
   ipcMain.handle('agent:run', (event, prompt, settings, sessionId, runId) => runAgent(prompt, settings, sessionId, runId, event.sender));
   ipcMain.handle('agent:cancel', (_, runId) => {
-    const controller = activeRuns.get(runId);
-    if (!controller) return false;
-    controller.abort();
+    const state = activeRuns.get(runId);
+    if (!state) return false;
+    cancelApprovalsForRun(runId);
+    try { state.child?.kill(); } catch {}
+    state.controller.abort();
     return true;
   });
+  ipcMain.handle('agent:approval', (_, approvalId, allowed) => resolveApproval(approvalId, allowed));
 
   createWindow();
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
@@ -496,7 +634,11 @@ app.on('before-quit', () => {
   clearTimeout(workspaceWatchTimer);
   workspaceWatcher?.close();
   workspaceWatcher = null;
-  for (const controller of activeRuns.values()) controller.abort();
+  for (const [runId, state] of activeRuns.entries()) {
+    cancelApprovalsForRun(runId);
+    try { state.child?.kill(); } catch {}
+    state.controller.abort();
+  }
   activeRuns.clear();
 });
 
