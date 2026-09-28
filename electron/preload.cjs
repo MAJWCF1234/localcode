@@ -19,6 +19,7 @@ contextBridge.exposeInMainWorld('localcode', {
 
   runAgent: (prompt, settings, sessionId, runId) => ipcRenderer.invoke('agent:run', prompt, settings, sessionId, runId),
   cancelAgent: (runId) => ipcRenderer.invoke('agent:cancel', runId),
+  resolveAgentApproval: (approvalId, allowed) => ipcRenderer.invoke('agent:approval', approvalId, allowed),
 
   onWorkspaceChanged: (callback) => {
     const handler = () => callback();
