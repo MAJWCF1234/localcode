@@ -9,5 +9,11 @@ contextBridge.exposeInMainWorld('localcode', {
   rename: (from, to) => ipcRenderer.invoke('workspace:rename', from, to),
   getSettings: () => ipcRenderer.invoke('settings:get'),
   setSettings: (settings) => ipcRenderer.invoke('settings:set', settings),
-  runAgent: (prompt, settings) => ipcRenderer.invoke('agent:run', prompt, settings)
+  listModels: (settings) => ipcRenderer.invoke('models:list', settings),
+  runAgent: (prompt, settings) => ipcRenderer.invoke('agent:run', prompt, settings),
+  onWorkspaceChanged: (callback) => {
+    const handler = () => callback();
+    ipcRenderer.on('workspace:changed', handler);
+    return () => ipcRenderer.removeListener('workspace:changed', handler);
+  }
 });
