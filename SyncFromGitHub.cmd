@@ -1,6 +1,11 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
+
+if /I "%~1"=="--handoff" goto :handoff
+
 cd /d "%~dp0"
+set "RESUME=0"
+if /I "%~1"=="--resume" set "RESUME=1"
 
 echo ============================================================
 echo   LOCALCODE - SYNC FROM GITHUB
@@ -31,21 +36,32 @@ echo [1/5] Fetching latest GitHub state...
 git fetch origin main
 if errorlevel 1 goto :fail
 
+if "%RESUME%"=="0" (
+  git diff --quiet -- SyncFromGitHub.cmd
+  if errorlevel 1 (
+    echo [SELF-UPDATE] Local SyncFromGitHub.cmd differs from GitHub-tracked state.
+    echo [SELF-UPDATE] Handing off to a temporary updater...
+    set "HELPER=%TEMP%\LocalCodeSync-%RANDOM%%RANDOM%.cmd"
+    copy /y "%~f0" "!HELPER!" >nul
+    if errorlevel 1 goto :fail
+    start "" /wait cmd /c ""!HELPER!" --handoff "%CD%""
+    exit /b %errorlevel%
+  )
+)
+
 echo [2/5] Backing up local tracked edits...
 for /f "delims=" %%F in ('git diff --name-only') do (
-  if /I not "%%F"=="SyncFromGitHub.cmd" (
-    echo [BACKUP] %%F
-    for %%D in ("!BACKUP_ROOT!\%%F") do if not exist "%%~dpD" mkdir "%%~dpD" >nul 2>nul
-    copy /y "%%F" "!BACKUP_ROOT!\%%F" >nul
-    if errorlevel 1 (
-      echo [ERROR] Could not back up %%F
-      goto :fail
-    )
-    git restore --worktree -- "%%F"
-    if errorlevel 1 (
-      echo [ERROR] Could not restore tracked file %%F
-      goto :fail
-    )
+  echo [BACKUP] %%F
+  for %%D in ("!BACKUP_ROOT!\%%F") do if not exist "%%~dpD" mkdir "%%~dpD" >nul 2>nul
+  copy /y "%%F" "!BACKUP_ROOT!\%%F" >nul
+  if errorlevel 1 (
+    echo [ERROR] Could not back up %%F
+    goto :fail
+  )
+  git restore --worktree -- "%%F"
+  if errorlevel 1 (
+    echo [ERROR] Could not restore tracked file %%F
+    goto :fail
   )
 )
 
@@ -57,15 +73,9 @@ for /f "usebackq delims=" %%F in (`git diff --name-only --diff-filter=A HEAD..or
       echo [BACKUP] Untracked local file would be overwritten: %%F
       for %%D in ("!BACKUP_ROOT!\%%F") do if not exist "%%~dpD" mkdir "%%~dpD" >nul 2>nul
       copy /y "%%F" "!BACKUP_ROOT!\%%F" >nul
-      if errorlevel 1 (
-        echo [ERROR] Could not back up %%F
-        goto :fail
-      )
+      if errorlevel 1 goto :fail
       del /q "%%F"
-      if errorlevel 1 (
-        echo [ERROR] Could not move conflicting untracked file out of the way: %%F
-        goto :fail
-      )
+      if errorlevel 1 goto :fail
     )
   )
 )
@@ -97,6 +107,20 @@ echo.
 git status --short
 pause
 exit /b 0
+
+:handoff
+set "TARGET=%~2"
+if not defined TARGET exit /b 1
+timeout /t 1 /nobreak >nul
+cd /d "%TARGET%" || exit /b 1
+if not exist ".localcode-sync-backup" mkdir ".localcode-sync-backup" >nul 2>nul
+if exist "SyncFromGitHub.cmd" copy /y "SyncFromGitHub.cmd" ".localcode-sync-backup\SyncFromGitHub.cmd.local-before-self-update" >nul
+git restore --worktree -- SyncFromGitHub.cmd
+if errorlevel 1 exit /b 1
+call ".\SyncFromGitHub.cmd" --resume
+set "RC=%errorlevel%"
+del /q "%~f0" >nul 2>nul
+exit /b %RC%
 
 :fail
 echo.
