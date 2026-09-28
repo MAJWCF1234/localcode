@@ -16,6 +16,7 @@ contextBridge.exposeInMainWorld('localcode', {
   newChat: () => ipcRenderer.invoke('chat:new'),
   selectChat: (id) => ipcRenderer.invoke('chat:select', id),
   deleteChat: (id) => ipcRenderer.invoke('chat:delete', id),
+  undoRun: (runId) => ipcRenderer.invoke('history:undo', runId),
 
   runAgent: (prompt, settings, sessionId, runId) => ipcRenderer.invoke('agent:run', prompt, settings, sessionId, runId),
   cancelAgent: (runId) => ipcRenderer.invoke('agent:cancel', runId),
