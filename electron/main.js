@@ -9,6 +9,9 @@ const ROOT = path.resolve(__dirname, '..');
 const WORKSPACE = path.join(ROOT, 'workspace');
 const SETTINGS = path.join(ROOT, 'localcode.settings.json');
 
+let workspaceWatcher = null;
+let workspaceWatchTimer = null;
+
 function lexicalSafePath(rel = '') {
   if (path.isAbsolute(rel) || rel.split(/[\\/]+/).includes('..')) {
     throw new Error('Absolute paths and .. are not allowed');
@@ -47,9 +50,10 @@ async function walk(dir = WORKSPACE, base = WORKSPACE) {
   for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
     const full = path.join(dir, entry.name);
     const rel = path.relative(base, full).replaceAll('\\', '/');
+    if (entry.isSymbolicLink()) continue;
     if (entry.isDirectory()) {
       out.push({ type: 'dir', name: entry.name, path: rel, children: await walk(full, base) });
-    } else {
+    } else if (entry.isFile()) {
       out.push({ type: 'file', name: entry.name, path: rel });
     }
   }
@@ -61,8 +65,9 @@ async function listFlat(dir = WORKSPACE, base = WORKSPACE, acc = []) {
   for (const entry of entries) {
     const full = path.join(dir, entry.name);
     const rel = path.relative(base, full).replaceAll('\\', '/');
+    if (entry.isSymbolicLink()) continue;
     if (entry.isDirectory()) await listFlat(full, base, acc);
-    else acc.push(rel);
+    else if (entry.isFile()) acc.push(rel);
   }
   return acc;
 }
@@ -115,14 +120,26 @@ async function saveSettings(settings) {
   return settings;
 }
 
+function apiHeaders(settings) {
+  return {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${settings.apiKey || 'localcode'}`
+  };
+}
+
+async function listModels(settings) {
+  const base = settings.baseUrl.replace(/\/$/, '');
+  const response = await fetch(`${base}/models`, { headers: apiHeaders(settings) });
+  if (!response.ok) throw new Error(`Model API ${response.status}: ${await response.text()}`);
+  const data = await response.json();
+  return (data.data || []).map(model => model.id).filter(Boolean).sort();
+}
+
 async function callModel(settings, messages) {
   const base = settings.baseUrl.replace(/\/$/, '');
   const response = await fetch(`${base}/chat/completions`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${settings.apiKey || 'localcode'}`
-    },
+    headers: apiHeaders(settings),
     body: JSON.stringify({
       model: settings.model,
       messages,
@@ -207,6 +224,22 @@ async function runAgent(prompt, settings) {
   return { message: 'Stopped after 16 agent steps.', log, tree: await walk() };
 }
 
+function startWorkspaceWatcher() {
+  if (workspaceWatcher) return;
+  try {
+    workspaceWatcher = fsSync.watch(WORKSPACE, { recursive: true }, () => {
+      clearTimeout(workspaceWatchTimer);
+      workspaceWatchTimer = setTimeout(() => {
+        for (const win of BrowserWindow.getAllWindows()) {
+          if (!win.isDestroyed()) win.webContents.send('workspace:changed');
+        }
+      }, 120);
+    });
+  } catch (err) {
+    console.warn('Workspace watcher unavailable:', err.message);
+  }
+}
+
 function createWindow() {
   const win = new BrowserWindow({
     width: 1500,
@@ -228,6 +261,7 @@ function createWindow() {
 
 app.whenReady().then(async () => {
   await ensureWorkspace();
+  startWorkspaceWatcher();
   ipcMain.handle('workspace:tree', () => walk());
   ipcMain.handle('workspace:read', (_, rel) => readText(rel));
   ipcMain.handle('workspace:write', (_, rel, content) => writeText(rel, content));
@@ -236,9 +270,16 @@ app.whenReady().then(async () => {
   ipcMain.handle('workspace:rename', (_, a, b) => renamePath(a, b));
   ipcMain.handle('settings:get', () => loadSettings());
   ipcMain.handle('settings:set', (_, s) => saveSettings(s));
+  ipcMain.handle('models:list', (_, s) => listModels(s));
   ipcMain.handle('agent:run', (_, prompt, settings) => runAgent(prompt, settings));
   createWindow();
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
+});
+
+app.on('before-quit', () => {
+  clearTimeout(workspaceWatchTimer);
+  workspaceWatcher?.close();
+  workspaceWatcher = null;
 });
 
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
