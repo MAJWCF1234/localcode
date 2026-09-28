@@ -33,6 +33,7 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [activeRunId, setActiveRunId] = useState('');
   const [liveEvents, setLiveEvents] = useState([]);
+  const [pendingApproval, setPendingApproval] = useState(null);
 
   const [chatState, setChatState] = useState({ activeId:null, sessions:[], messages:[] });
 
@@ -52,9 +53,12 @@ function App() {
 
     const unsubscribeWorkspace = window.localcode.onWorkspaceChanged?.(() => refresh());
     const unsubscribeAgent = window.localcode.onAgentEvent?.((event) => {
+      if (event.type === 'approval' && event.approvalId) {
+        setPendingApproval(event);
+      }
       setLiveEvents(events => {
         const next = [...events, event];
-        return next.slice(-12);
+        return next.slice(-16);
       });
     });
 
@@ -128,12 +132,14 @@ function App() {
   const startNewChat = async () => {
     if (busy) return;
     setLiveEvents([]);
+    setPendingApproval(null);
     setChatState(await window.localcode.newChat());
   };
 
   const switchChat = async (id) => {
     if (busy || !id) return;
     setLiveEvents([]);
+    setPendingApproval(null);
     setChatState(await window.localcode.selectChat(id));
   };
 
@@ -141,6 +147,7 @@ function App() {
     if (busy || !chatState.activeId) return;
     if (!window.confirm('Delete this LocalCode chat?')) return;
     setLiveEvents([]);
+    setPendingApproval(null);
     setChatState(await window.localcode.deleteChat(chatState.activeId));
   };
 
@@ -155,6 +162,7 @@ function App() {
     setBusy(true);
     setActiveRunId(runId);
     setLiveEvents([{ runId, type:'status', text:'Starting agent run…' }]);
+    setPendingApproval(null);
 
     setChatState(state => ({
       ...state,
@@ -195,12 +203,21 @@ function App() {
     } finally {
       setBusy(false);
       setActiveRunId('');
+      setPendingApproval(null);
     }
   };
 
   const cancelRun = async () => {
     if (!activeRunId) return;
+    setPendingApproval(null);
     await window.localcode.cancelAgent(activeRunId);
+  };
+
+  const resolveApproval = async (allowed) => {
+    if (!pendingApproval?.approvalId) return;
+    const approvalId = pendingApproval.approvalId;
+    setPendingApproval(null);
+    await window.localcode.resolveAgentApproval(approvalId, allowed);
   };
 
   const title = useMemo(() => current ? `${current}${dirty ? ' •' : ''}` : 'No file open', [current, dirty]);
@@ -273,6 +290,16 @@ function App() {
           {busy && <div className="live-run">
             <div className="live-title"><span className="pulse">●</span> AGENT RUNNING</div>
             {liveEvents.map((event,i)=><div className={`live-event ${event.type}`} key={i}>{event.text}</div>)}
+          </div>}
+
+          {pendingApproval && <div className="approval-card">
+            <div className="approval-title">TERMINAL PERMISSION</div>
+            <div className="approval-copy">LocalCode wants to run this command from <b>workspace/</b>. Shell commands can still affect the rest of your machine.</div>
+            <pre>{pendingApproval.command}</pre>
+            <div className="approval-actions">
+              <button className="deny" onClick={() => resolveApproval(false)}>Deny</button>
+              <button className="allow" onClick={() => resolveApproval(true)}>Allow once</button>
+            </div>
           </div>}
         </div>
 
