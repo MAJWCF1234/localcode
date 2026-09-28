@@ -25,29 +25,37 @@ if not exist ".git" (
   exit /b 1
 )
 
-for /f "delims=" %%I in ('git status --porcelain --untracked-files=no') do (
-  echo [STOPPED] Tracked local changes exist.
-  echo Commit or discard them before syncing so nothing is overwritten.
-  echo.
-  git status --short
-  pause
-  exit /b 1
-)
+set "BACKUP_ROOT=.localcode-sync-backup"
 
-echo [1/4] Fetching latest GitHub state...
+echo [1/5] Fetching latest GitHub state...
 git fetch origin main
 if errorlevel 1 goto :fail
 
-echo [2/4] Checking for untracked-file collisions...
-set "BACKUP_ROOT=.localcode-sync-backup"
+echo [2/5] Backing up local tracked edits...
+for /f "delims=" %%F in ('git diff --name-only') do (
+  if /I not "%%F"=="SyncFromGitHub.cmd" (
+    echo [BACKUP] %%F
+    for %%D in ("!BACKUP_ROOT!\%%F") do if not exist "%%~dpD" mkdir "%%~dpD" >nul 2>nul
+    copy /y "%%F" "!BACKUP_ROOT!\%%F" >nul
+    if errorlevel 1 (
+      echo [ERROR] Could not back up %%F
+      goto :fail
+    )
+    git restore --worktree -- "%%F"
+    if errorlevel 1 (
+      echo [ERROR] Could not restore tracked file %%F
+      goto :fail
+    )
+  )
+)
 
+echo [3/5] Checking untracked-file collisions...
 for /f "usebackq delims=" %%F in (`git diff --name-only --diff-filter=A HEAD..origin/main`) do (
   if exist "%%F" (
     git ls-files --error-unmatch "%%F" >nul 2>nul
     if errorlevel 1 (
       echo [BACKUP] Untracked local file would be overwritten: %%F
-      if not exist "!BACKUP_ROOT!" mkdir "!BACKUP_ROOT!" >nul 2>nul
-      for %%D in ("%%F") do if not exist "!BACKUP_ROOT!\%%~dpD" mkdir "!BACKUP_ROOT!\%%~dpD" >nul 2>nul
+      for %%D in ("!BACKUP_ROOT!\%%F") do if not exist "%%~dpD" mkdir "%%~dpD" >nul 2>nul
       copy /y "%%F" "!BACKUP_ROOT!\%%F" >nul
       if errorlevel 1 (
         echo [ERROR] Could not back up %%F
@@ -62,7 +70,7 @@ for /f "usebackq delims=" %%F in (`git diff --name-only --diff-filter=A HEAD..or
   )
 )
 
-echo [3/4] Fast-forwarding local source from GitHub...
+echo [4/5] Fast-forwarding local source from GitHub...
 git checkout main >nul
 if errorlevel 1 goto :fail
 
@@ -76,12 +84,13 @@ if errorlevel 1 (
   exit /b 1
 )
 
-echo [4/4] Done.
+echo [5/5] Done.
 echo.
 echo workspace\, localcode.settings.json, node_modules\, and other ignored
 echo local data were left alone.
 if exist "%BACKUP_ROOT%" (
-  echo Any conflicting untracked files were preserved under:
+  echo.
+  echo Local source edits that had to be moved were preserved under:
   echo   %CD%\%BACKUP_ROOT%
 )
 echo.
