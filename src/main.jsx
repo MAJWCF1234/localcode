@@ -220,6 +220,32 @@ function App() {
     await window.localcode.resolveAgentApproval(approvalId, allowed);
   };
 
+  const undoRun = async (message) => {
+    if (!message?.runId || !message?.changes?.length || busy) return;
+    const warning = message.terminalUsed
+      ? 'Undo LocalCode file-tool edits from this run? A terminal command also ran, and terminal-made changes cannot be fully restored automatically.'
+      : 'Undo LocalCode file edits from this run? This restores the affected paths to their state before the run and can overwrite newer edits to those same paths.';
+    if (!window.confirm(warning)) return;
+
+    try {
+      const result = await window.localcode.undoRun(message.runId);
+      setTree(result.tree || await window.localcode.tree());
+      if (current) {
+        try {
+          setContent(await window.localcode.read(current));
+          setDirty(false);
+        } catch {
+          setCurrent('');
+          setContent('');
+          setDirty(false);
+        }
+      }
+      setLiveEvents(events => [...events, { type:'status', text:`Restored ${result.restored?.length || 0} path(s) from run snapshot` }].slice(-16));
+    } catch (error) {
+      window.alert(`Undo failed: ${error.message}`);
+    }
+  };
+
   const title = useMemo(() => current ? `${current}${dirty ? ' •' : ''}` : 'No file open', [current, dirty]);
 
   return <div className="app">
@@ -283,6 +309,12 @@ function App() {
             <div className={`msg ${m.role}`} key={m.id || i}>
               <b>{m.role === 'user' ? 'you' : m.role}</b>
               <div className="msg-text">{m.content}</div>
+              {m.changes?.length>0 && <div className="change-summary">
+                <div><b>{m.changes.length} path{m.changes.length === 1 ? '' : 's'} changed</b>{m.terminalUsed ? ' · terminal also used' : ''}</div>
+                <div className="change-paths">{m.changes.slice(0,6).map(change => <span key={change.path}>{change.path}</span>)}</div>
+                {m.changes.length > 6 && <div className="change-more">+{m.changes.length - 6} more</div>}
+                <button disabled={busy} onClick={() => undoRun(m)}>Undo file edits</button>
+              </div>}
               {m.log?.length>0 && <details><summary>{m.log.length} tool actions</summary><pre>{m.log.join('\n')}</pre></details>}
             </div>
           )}
