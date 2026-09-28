@@ -2,15 +2,18 @@ import { app, BrowserWindow, ipcMain } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
 const WORKSPACE = path.join(ROOT, 'workspace');
 const SETTINGS = path.join(ROOT, 'localcode.settings.json');
+const SESSIONS = path.join(ROOT, 'localcode.sessions.json');
 
 let workspaceWatcher = null;
 let workspaceWatchTimer = null;
+const activeRuns = new Map();
 
 function lexicalSafePath(rel = '') {
   if (path.isAbsolute(rel) || rel.split(/[\\/]+/).includes('..')) {
@@ -101,12 +104,38 @@ async function renamePath(from, to) {
   return true;
 }
 
+async function searchWorkspace(query, limit = 30) {
+  const needle = String(query || '').trim().toLowerCase();
+  if (!needle) return [];
+  const files = await listFlat();
+  const hits = [];
+  for (const rel of files) {
+    if (hits.length >= limit) break;
+    try {
+      const p = await safePath(rel);
+      const stat = await fs.stat(p);
+      if (stat.size > 512_000) continue;
+      const text = await fs.readFile(p, 'utf8');
+      const lines = text.split(/\r?\n/);
+      for (let i = 0; i < lines.length && hits.length < limit; i++) {
+        if (lines[i].toLowerCase().includes(needle)) {
+          hits.push({ path: rel, line: i + 1, text: lines[i].slice(0, 300) });
+        }
+      }
+    } catch {
+      // Ignore binary/unreadable files during text search.
+    }
+  }
+  return hits;
+}
+
 async function loadSettings() {
   const defaults = {
     baseUrl: 'http://127.0.0.1:1234/v1',
     model: 'google/gemma-4-31b-qat',
     apiKey: 'lm-studio',
-    temperature: 0.2
+    temperature: 0.2,
+    maxAgentSteps: 24
   };
   try {
     return { ...defaults, ...JSON.parse(await fs.readFile(SETTINGS, 'utf8')) };
@@ -135,11 +164,12 @@ async function listModels(settings) {
   return (data.data || []).map(model => model.id).filter(Boolean).sort();
 }
 
-async function callModel(settings, messages) {
+async function callModel(settings, messages, signal) {
   const base = settings.baseUrl.replace(/\/$/, '');
   const response = await fetch(`${base}/chat/completions`, {
     method: 'POST',
     headers: apiHeaders(settings),
+    signal,
     body: JSON.stringify({
       model: settings.model,
       messages,
@@ -161,67 +191,237 @@ function extractJson(text) {
   try { return JSON.parse(candidate.slice(start, end + 1)); } catch { return null; }
 }
 
-async function runAgent(prompt, settings) {
+function newSession(title = 'New chat') {
+  const now = new Date().toISOString();
+  return { id: randomUUID(), title, createdAt: now, updatedAt: now, messages: [] };
+}
+
+async function loadSessionStore() {
+  try {
+    const store = JSON.parse(await fs.readFile(SESSIONS, 'utf8'));
+    if (!Array.isArray(store.sessions)) throw new Error('Invalid sessions file');
+    if (!store.sessions.length) {
+      const session = newSession();
+      return { activeId: session.id, sessions: [session] };
+    }
+    if (!store.sessions.some(s => s.id === store.activeId)) store.activeId = store.sessions[0].id;
+    return store;
+  } catch {
+    const session = newSession();
+    const store = { activeId: session.id, sessions: [session] };
+    await saveSessionStore(store);
+    return store;
+  }
+}
+
+async function saveSessionStore(store) {
+  await fs.writeFile(SESSIONS, JSON.stringify(store, null, 2) + '\n', 'utf8');
+}
+
+function publicChatState(store) {
+  const active = store.sessions.find(s => s.id === store.activeId) || store.sessions[0];
+  return {
+    activeId: active?.id || null,
+    sessions: store.sessions
+      .map(({ id, title, createdAt, updatedAt }) => ({ id, title, createdAt, updatedAt }))
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)),
+    messages: active?.messages || []
+  };
+}
+
+async function getChatState() {
+  return publicChatState(await loadSessionStore());
+}
+
+async function createChat() {
+  const store = await loadSessionStore();
+  const session = newSession();
+  store.sessions.push(session);
+  store.activeId = session.id;
+  await saveSessionStore(store);
+  return publicChatState(store);
+}
+
+async function selectChat(id) {
+  const store = await loadSessionStore();
+  if (!store.sessions.some(s => s.id === id)) throw new Error('Chat session not found');
+  store.activeId = id;
+  await saveSessionStore(store);
+  return publicChatState(store);
+}
+
+async function deleteChat(id) {
+  const store = await loadSessionStore();
+  store.sessions = store.sessions.filter(s => s.id !== id);
+  if (!store.sessions.length) store.sessions.push(newSession());
+  if (!store.sessions.some(s => s.id === store.activeId)) store.activeId = store.sessions[0].id;
+  await saveSessionStore(store);
+  return publicChatState(store);
+}
+
+function emitAgent(sender, runId, event) {
+  if (!sender?.isDestroyed()) sender.send('agent:event', { runId, ...event });
+}
+
+async function runAgent(prompt, settings, sessionId, runId, sender) {
   await ensureWorkspace();
+  const controller = new AbortController();
+  activeRuns.set(runId, controller);
+
+  const store = await loadSessionStore();
+  const session = store.sessions.find(s => s.id === sessionId) || store.sessions.find(s => s.id === store.activeId);
+  if (!session) throw new Error('Chat session not found');
+
+  const userMessage = { id: randomUUID(), role: 'user', content: prompt, createdAt: new Date().toISOString() };
+  session.messages.push(userMessage);
+  if (session.title === 'New chat') session.title = prompt.trim().replace(/\s+/g, ' ').slice(0, 52) || 'New chat';
+  session.updatedAt = new Date().toISOString();
+  store.activeId = session.id;
+  await saveSessionStore(store);
+
   const files = await listFlat();
+  const history = session.messages
+    .slice(-14, -1)
+    .filter(m => m.role === 'user' || m.role === 'assistant')
+    .map(m => ({ role: m.role, content: m.content }));
+
   const messages = [
     {
       role: 'system',
-      content: `You are LocalCode, a local coding agent. You may only operate inside ./workspace.\n\nAvailable actions:\n- {"action":"read","path":"relative/path"}\n- {"action":"write","path":"relative/path","content":"complete file contents"}\n- {"action":"delete","path":"relative/path"}\n- {"action":"rename","from":"old/path","to":"new/path"}\n- {"action":"list"}\n- {"action":"done","message":"summary"}\n\nReturn exactly ONE JSON object per turn and no other text. Use read before editing an existing file unless its contents were already provided to you. Never use absolute paths or .. segments. When writing, provide the COMPLETE replacement file content. Finish with done. Current workspace files:\n${files.join('\n') || '(empty)'}`
+      content: `You are LocalCode, a persistent local coding agent. You may only operate inside ./workspace.
+
+Available actions:
+- {"action":"list"}
+- {"action":"read","path":"relative/path"}
+- {"action":"search","query":"text"}
+- {"action":"write","path":"relative/path","content":"complete file contents"}
+- {"action":"mkdir","path":"relative/folder"}
+- {"action":"delete","path":"relative/path"}
+- {"action":"rename","from":"old/path","to":"new/path"}
+- {"action":"done","message":"clear summary of what you did or what you found"}
+
+Return exactly ONE JSON object per turn and no other text.
+Use read before editing an existing file unless its current contents were already provided.
+Use search when you know a symbol or phrase but not its location.
+Never use absolute paths or .. segments.
+When writing, provide COMPLETE replacement file contents.
+Do not claim a build/test passed because no terminal execution tool is currently available.
+Finish with done.
+
+Current workspace files:
+${files.join('\n') || '(empty)'}`
     },
+    ...history,
     { role: 'user', content: prompt }
   ];
 
   const log = [];
-  for (let step = 0; step < 16; step++) {
-    const raw = await callModel(settings, messages);
-    const action = extractJson(raw);
-    if (!action?.action) {
-      messages.push({ role: 'assistant', content: raw });
-      messages.push({ role: 'user', content: 'Invalid response. Return exactly one valid JSON action object.' });
-      continue;
-    }
+  const maxSteps = Math.max(4, Math.min(Number(settings.maxAgentSteps) || 24, 64));
 
-    let result;
-    try {
-      switch (action.action) {
-        case 'read':
-          result = await readText(action.path);
-          log.push(`read ${action.path}`);
-          break;
-        case 'write':
-          await writeText(action.path, String(action.content ?? ''));
-          result = `wrote ${action.path}`;
-          log.push(result);
-          break;
-        case 'delete':
-          await deletePath(action.path);
-          result = `deleted ${action.path}`;
-          log.push(result);
-          break;
-        case 'rename':
-          await renamePath(action.from, action.to);
-          result = `renamed ${action.from} -> ${action.to}`;
-          log.push(result);
-          break;
-        case 'list':
-          result = (await listFlat()).join('\n') || '(empty)';
-          log.push('listed workspace');
-          break;
-        case 'done':
-          return { message: action.message || 'Done.', log, tree: await walk() };
-        default:
-          result = `Unknown action ${action.action}`;
+  try {
+    for (let step = 0; step < maxSteps; step++) {
+      emitAgent(sender, runId, { type: 'thinking', step: step + 1, maxSteps, text: 'Model is planning the next action…' });
+      const raw = await callModel(settings, messages, controller.signal);
+      const action = extractJson(raw);
+
+      if (!action?.action) {
+        log.push('model returned invalid action JSON; retrying');
+        emitAgent(sender, runId, { type: 'warning', text: 'Model returned invalid tool JSON. Retrying…' });
+        messages.push({ role: 'assistant', content: raw });
+        messages.push({ role: 'user', content: 'Invalid response. Return exactly one valid JSON action object.' });
+        continue;
       }
-    } catch (err) {
-      result = `ERROR: ${err.message}`;
-      log.push(result);
+
+      let result;
+      try {
+        switch (action.action) {
+          case 'read':
+            emitAgent(sender, runId, { type: 'tool', tool: 'read', text: `Reading ${action.path}`, path: action.path });
+            result = await readText(action.path);
+            log.push(`read ${action.path}`);
+            break;
+          case 'search': {
+            emitAgent(sender, runId, { type: 'tool', tool: 'search', text: `Searching for "${action.query}"` });
+            const hits = await searchWorkspace(action.query);
+            result = hits.length ? hits.map(h => `${h.path}:${h.line}: ${h.text}`).join('\n') : '(no matches)';
+            log.push(`searched "${action.query}" (${hits.length} hits)`);
+            break;
+          }
+          case 'write':
+            emitAgent(sender, runId, { type: 'tool', tool: 'write', text: `Writing ${action.path}`, path: action.path });
+            await writeText(action.path, String(action.content ?? ''));
+            result = `wrote ${action.path}`;
+            log.push(result);
+            break;
+          case 'mkdir':
+            emitAgent(sender, runId, { type: 'tool', tool: 'mkdir', text: `Creating ${action.path}`, path: action.path });
+            await fs.mkdir(await safePath(action.path, true), { recursive: true });
+            result = `created directory ${action.path}`;
+            log.push(result);
+            break;
+          case 'delete':
+            emitAgent(sender, runId, { type: 'tool', tool: 'delete', text: `Deleting ${action.path}`, path: action.path });
+            await deletePath(action.path);
+            result = `deleted ${action.path}`;
+            log.push(result);
+            break;
+          case 'rename':
+            emitAgent(sender, runId, { type: 'tool', tool: 'rename', text: `Renaming ${action.from} → ${action.to}` });
+            await renamePath(action.from, action.to);
+            result = `renamed ${action.from} -> ${action.to}`;
+            log.push(result);
+            break;
+          case 'list':
+            emitAgent(sender, runId, { type: 'tool', tool: 'list', text: 'Scanning workspace files' });
+            result = (await listFlat()).join('\n') || '(empty)';
+            log.push('listed workspace');
+            break;
+          case 'done': {
+            const assistantMessage = {
+              id: randomUUID(),
+              role: 'assistant',
+              content: action.message || 'Done.',
+              log,
+              createdAt: new Date().toISOString()
+            };
+            session.messages.push(assistantMessage);
+            session.updatedAt = new Date().toISOString();
+            await saveSessionStore(store);
+            emitAgent(sender, runId, { type: 'done', text: assistantMessage.content });
+            return { message: assistantMessage.content, log, tree: await walk(), chat: publicChatState(store) };
+          }
+          default:
+            result = `Unknown action ${action.action}`;
+            log.push(result);
+        }
+      } catch (err) {
+        result = `ERROR: ${err.message}`;
+        log.push(result);
+        emitAgent(sender, runId, { type: 'warning', text: result });
+      }
+
+      messages.push({ role: 'assistant', content: JSON.stringify(action) });
+      messages.push({ role: 'user', content: `RESULT:\n${result}` });
     }
 
-    messages.push({ role: 'assistant', content: JSON.stringify(action) });
-    messages.push({ role: 'user', content: `RESULT:\n${result}` });
+    const message = `Stopped after ${maxSteps} agent steps before receiving a done action.`;
+    session.messages.push({ id: randomUUID(), role: 'assistant', content: message, log, createdAt: new Date().toISOString() });
+    session.updatedAt = new Date().toISOString();
+    await saveSessionStore(store);
+    return { message, log, tree: await walk(), chat: publicChatState(store) };
+  } catch (err) {
+    if (err?.name === 'AbortError') {
+      const message = 'Run cancelled.';
+      session.messages.push({ id: randomUUID(), role: 'assistant', content: message, log, createdAt: new Date().toISOString() });
+      session.updatedAt = new Date().toISOString();
+      await saveSessionStore(store);
+      emitAgent(sender, runId, { type: 'cancelled', text: message });
+      return { message, log, tree: await walk(), chat: publicChatState(store), cancelled: true };
+    }
+    throw err;
+  } finally {
+    activeRuns.delete(runId);
   }
-  return { message: 'Stopped after 16 agent steps.', log, tree: await walk() };
 }
 
 function startWorkspaceWatcher() {
@@ -261,17 +461,33 @@ function createWindow() {
 
 app.whenReady().then(async () => {
   await ensureWorkspace();
+  await loadSessionStore();
   startWorkspaceWatcher();
+
   ipcMain.handle('workspace:tree', () => walk());
   ipcMain.handle('workspace:read', (_, rel) => readText(rel));
   ipcMain.handle('workspace:write', (_, rel, content) => writeText(rel, content));
   ipcMain.handle('workspace:createFolder', async (_, rel) => { await fs.mkdir(await safePath(rel, true), { recursive: true }); return true; });
   ipcMain.handle('workspace:delete', (_, rel) => deletePath(rel));
   ipcMain.handle('workspace:rename', (_, a, b) => renamePath(a, b));
+
   ipcMain.handle('settings:get', () => loadSettings());
   ipcMain.handle('settings:set', (_, s) => saveSettings(s));
   ipcMain.handle('models:list', (_, s) => listModels(s));
-  ipcMain.handle('agent:run', (_, prompt, settings) => runAgent(prompt, settings));
+
+  ipcMain.handle('chat:state', () => getChatState());
+  ipcMain.handle('chat:new', () => createChat());
+  ipcMain.handle('chat:select', (_, id) => selectChat(id));
+  ipcMain.handle('chat:delete', (_, id) => deleteChat(id));
+
+  ipcMain.handle('agent:run', (event, prompt, settings, sessionId, runId) => runAgent(prompt, settings, sessionId, runId, event.sender));
+  ipcMain.handle('agent:cancel', (_, runId) => {
+    const controller = activeRuns.get(runId);
+    if (!controller) return false;
+    controller.abort();
+    return true;
+  });
+
   createWindow();
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 });
@@ -280,6 +496,8 @@ app.on('before-quit', () => {
   clearTimeout(workspaceWatchTimer);
   workspaceWatcher?.close();
   workspaceWatcher = null;
+  for (const controller of activeRuns.values()) controller.abort();
+  activeRuns.clear();
 });
 
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
