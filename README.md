@@ -1,58 +1,74 @@
 # LocalCode
 
-LocalCode is a desktop, local-first coding agent and editor that talks directly to an OpenAI-compatible local model endpoint such as LM Studio.
+LocalCode is a desktop, local-first coding agent and editor for OpenAI-compatible local model servers such as LM Studio.
 
-## What it does
+## Current agent harness
 
-- Uses `./workspace` as the only editable project root.
-- Automatically notices files and folders dropped into `workspace/` while the app is open.
-- Opens and edits files with Monaco Editor.
-- Supports Ctrl+S / Cmd+S for normal editor saves.
-- Lets the local model read, create, overwrite, rename, and delete files inside `workspace/`.
-- Rejects file operations that try to escape the workspace root.
-- Ignores symlinks inside the workspace so they cannot be used to escape the sandbox.
-- Connects directly to LM Studio at `http://127.0.0.1:1234/v1` by default.
-- Can query the local server's `/models` endpoint from Settings and populate available model IDs.
-- Model name, endpoint, API key, and temperature are configurable locally.
+LocalCode now has a persistent multi-turn agent loop rather than a one-shot prompt wrapper.
 
-## Run
+- Multiple local chat sessions
+- Chat history persists in `localcode.sessions.json`
+- Follow-up prompts include recent chat context
+- Live agent activity is shown while a run is executing
+- Runs can be cancelled
+- Maximum agent steps are configurable
+- Workspace text search is available to the agent
+- Agent state and settings remain local and are ignored by Git
 
-Requirements: Node.js 20+ and LM Studio (or another OpenAI-compatible local server).
+The coding agent can inspect and modify files inside `./workspace` using its filesystem tools. It can list, read, search, create folders, write files, rename paths, and remove paths.
 
-```bash
-npm install
-npm run dev
-```
+## Workspace boundary
 
-Put any codebase you want LocalCode to work on inside:
+`./workspace` is the only app-managed project root.
 
-```text
-localcode/workspace/
-```
+- Files dropped into it are detected while LocalCode is open
+- Absolute paths and parent traversal are rejected
+- Symlink path components are rejected
+- Monaco is used for manual file editing
+- Ctrl+S / Cmd+S saves the current editor file
 
-Files dropped there should appear automatically. Then tell the agent what to build, fix, or change.
+## Chat
+
+The right-hand panel now supports:
+
+- persistent conversations
+- New Chat
+- chat switching
+- deleting old chats
+- live tool/action status
+- expandable action history on completed responses
+- Stop during a running agent task
 
 ## LM Studio
 
-Start the local server and load a coding-capable model. The default endpoint is:
+Default endpoint:
 
 ```text
-Base URL: http://127.0.0.1:1234/v1
-API key:  lm-studio
+http://127.0.0.1:1234/v1
 ```
 
-Open **Settings** and press **Detect models** to test the endpoint and retrieve the model IDs reported by the local server.
+Open Settings and use **Detect models** to query the local server and populate model IDs.
 
-The initial default model is `google/gemma-4-31b-qat`, but LocalCode is not tied to it.
+## Run on Windows
 
-## Security boundary
+```text
+StartLocalCode.cmd
+```
 
-All app-managed file paths are canonicalized and checked against the `workspace` directory before filesystem access. Absolute paths and traversal attempts cannot be used to reach files outside that root through LocalCode's file IPC or agent actions.
+The launcher installs dependencies if required, builds the frontend, verifies the output, and starts Electron.
 
-Symlinks encountered inside `workspace/` are ignored by the file tree and agent inventory, and direct file operations reject symlink path components.
+To update your local source:
 
-## Windows shortcuts
+```text
+SyncFromGitHub.cmd
+```
 
-- `StartLocalCode.cmd` installs dependencies on first launch and starts the app.
-- `PublishGitHub.cmd` initializes Git, signs into GitHub CLI if needed, creates `MAJWCF1234/localcode`, and pushes `main`.
-- `SyncFromGitHub.cmd` fetches and fast-forwards from GitHub without force-resetting local source changes. Ignored local data such as `workspace/` and `localcode.settings.json` stay local.
+The sync helper preserves ignored local data including `workspace/`, local settings, and chat sessions.
+
+## Still being built
+
+The main missing harness layer is terminal/build/test execution. It is intentionally not exposed as unrestricted shell access yet because arbitrary commands can escape a filesystem-only workspace sandbox.
+
+The planned terminal layer will include explicit command approval, visible command text, cancellation/timeouts, and separate permissions from ordinary workspace edits.
+
+Other planned improvements include diff/review UI, longer-context compaction, and token streaming.
