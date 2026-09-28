@@ -3,5 +3,6 @@ dist/
 localcode.settings.json
 localcode.sessions.json
 .localcode-sync-backup/
+.localcode-history/
 workspace/*
 !workspace/.gitkeep
